@@ -1,0 +1,107 @@
+# date-stage yayın bildirimi → Slack (#date)
+#
+# NEDEN: PM yayınları Slack'ten takip ediyor. Bu depoya her push bir yayındır
+# (index.html + assets + audio kopyalanır, GitHub Pages yeniden derler). İş akışı
+# Pages derlemesinin BİTMESİNİ bekler, sonra yayın notunu #date kanalına yazar —
+# yani mesaj atıldığında adres gerçekten güncel olur.
+#
+# MESAJIN KAYNAĞI: yayın commit'inin mesajıdır. Commit mesajları PM diliyle
+# (teknik terimsiz) yazılır; Slack'e giden metin de odur.
+#
+# GEREKEN TEK SIR: SLACK_WEBHOOK_URL (Settings → Secrets and variables → Actions).
+# Sır tanımlı değilse iş akışı SESSİZCE ve BAŞARIYLA biter — yayın asla bloke olmaz.
+
+name: Slack yayın bildirimi
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # elle deneme için
+
+permissions:
+  contents: read
+  pages: read
+
+jobs:
+  bildir:
+    runs-on: ubuntu-latest
+    # Sır JOB düzeyinde tanımlanır: adım düzeyindeki env, o adımın KENDİ if koşulunda
+    # görünmez (GitHub Actions kuralı) — koşul hep boş sanıp bildirimi atlardı.
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Depoyu al
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Pages derlemesinin bitmesini bekle
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # En fazla ~6 dk bekle. Derleme bitmezse bildirim yine de gider,
+          # yalnız durum satırı "yayın sürüyor" der (sessiz kalmak daha kötü).
+          durum="bilinmiyor"
+          for i in $(seq 1 24); do
+            yanit=$(gh api "repos/${GITHUB_REPOSITORY}/pages/builds/latest" 2>/dev/null || true)
+            [ -z "$yanit" ] && { sleep 15; continue; }
+            sha=$(echo "$yanit" | jq -r '.commit // ""')
+            st=$(echo "$yanit" | jq -r '.status // ""')
+            if [ "$sha" = "${GITHUB_SHA}" ] && [ "$st" = "built" ]; then durum="built"; break; fi
+            if [ "$sha" = "${GITHUB_SHA}" ] && [ "$st" = "errored" ]; then durum="errored"; break; fi
+            sleep 15
+          done
+          echo "durum=$durum" >> "$GITHUB_OUTPUT"
+
+      - name: Slack'e yaz
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          DURUM: ${{ steps.pages.outputs.durum }}
+        run: |
+          set -euo pipefail
+          baslik=$(git log -1 --pretty=%s)
+          govde=$(git log -1 --pretty=%b | sed '/^Co-Authored-By:/d' | sed '/^[[:space:]]*$/d')
+          # Ay adı koşucunun yerel ayarına göre İNGİLİZCE gelir; sayısal biçim
+          # dilden bağımsız ve PM için okunaklıdır.
+          tarih=$(TZ=Europe/Istanbul date '+%d.%m.%Y %H:%M')
+          kisa_sha=$(git rev-parse --short HEAD)
+
+          case "$DURUM" in
+            built)   durum_satiri="✅ Yayın tamamlandı" ;;
+            errored) durum_satiri="⚠️ Yayın derlemesi hata verdi — adres eski sürümde olabilir" ;;
+            *)       durum_satiri="⏳ Yayın sürüyor (birkaç dakika içinde güncellenir)" ;;
+          esac
+
+          # Payload jq ile kurulur: tırnak/satır sonu kaçışları elle yazılmaz.
+          jq -n \
+            --arg baslik "$baslik" \
+            --arg govde "$govde" \
+            --arg tarih "$tarih" \
+            --arg sha "$kisa_sha" \
+            --arg durum "$durum_satiri" \
+            '{
+              text: ("date-stage yayınlandı — " + $baslik),
+              blocks: [
+                {type: "header", text: {type: "plain_text", text: "📦 date-stage güncellendi", emoji: true}},
+                {type: "section", text: {type: "mrkdwn", text: ("*" + $baslik + "*")}},
+                (if ($govde | length) > 0
+                  then {type: "section", text: {type: "mrkdwn", text: $govde}}
+                  else empty end),
+                {type: "section", text: {type: "mrkdwn",
+                  text: ("<https://fikricaglar.github.io/date-stage/|🔗 Uygulamayı aç>  ·  " + $durum)}},
+                {type: "context", elements: [{type: "mrkdwn", text: ($tarih + "  ·  sürüm `" + $sha + "`")}]}
+              ]
+            }' > payload.json
+
+          kod=$(curl -sS -o yanit.txt -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            --data @payload.json "$SLACK_WEBHOOK_URL")
+          echo "Slack yanıtı: $kod $(cat yanit.txt)"
+          [ "$kod" = "200" ]
+
+      - name: Sır yoksa bilgilendir
+        if: ${{ env.SLACK_WEBHOOK_URL == '' }}
+        run: |
+          echo "SLACK_WEBHOOK_URL tanımlı değil — bildirim atlandı (yayın etkilenmedi)."
+          echo "Kurulum: Settings → Secrets and variables → Actions → New repository secret."
